@@ -8,7 +8,7 @@
 #define KERNEL_FILE_PATH "FluidSim/Kernels/Fluid_step.cl"
 #define KERNEL_NAME "fluid_step"
 
-#define SIMULATION_STEPS 200
+#define SIMULATION_STEPS 150
 #define PRINT_INTERVAL 1
 #define FRAME_SCALE 8
 
