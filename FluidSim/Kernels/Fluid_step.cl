@@ -8,7 +8,7 @@ inline int fluid_in_bounds(int x, int y, int width, int height)
     return (x >= 0 && x < width && y >= 0 && y < height);
 }
 
-inline int fluid_is_open_cell(__global const uchar* solid, int x, int y, int width, int height)
+inline int fluid_is_open(__global const uchar* solid, int x, int y, int width, int height)
 {
     int idx;
 
@@ -17,10 +17,10 @@ inline int fluid_is_open_cell(__global const uchar* solid, int x, int y, int wid
     }
 
     idx = fluid_index(x, y, width);
-    return solid[idx] == 0;
+    return (solid[idx] == 0);
 }
 
-inline float fluid_mass_at(
+inline float fluid_get_mass(
     __global const float* mass,
     __global const uchar* solid,
     int x,
@@ -46,8 +46,117 @@ inline float fluid_mass_at(
 
 inline float positive_min(float a, float b)
 {
-    float m = fmin(a, b);
-    return fmax(m, 0.0f);
+    float value = fmin(a, b);
+    return fmax(value, 0.0f);
+}
+
+inline float cell_capacity(int y, float max_mass)
+{
+    return max_mass + (float)y * 0.05f;
+}
+
+/*
+    Visszateresi ertek:
+    0 = nincs mozgas
+    1 = le
+    2 = bal-le
+    3 = jobb-le
+    4 = bal
+    5 = jobb
+*/
+inline int fluid_primary_direction(
+    __global const float* mass,
+    __global const uchar* solid,
+    int sx,
+    int sy,
+    int width,
+    int height,
+    float max_mass,
+    float min_mass
+)
+{
+    float self_mass;
+
+    float down_mass;
+    float down_left_mass;
+    float down_right_mass;
+    float left_mass;
+    float right_mass;
+
+    float down_capacity;
+    float down_left_capacity;
+    float down_right_capacity;
+
+    self_mass = fluid_get_mass(mass, solid, sx, sy, width, height);
+
+    if (self_mass <= min_mass) {
+        return 0;
+    }
+
+    /*
+        1. Lefele:
+        akkor mehet lefele, ha az also cella nyitott
+        es meg van benne kapacitas.
+    */
+    if (fluid_is_open(solid, sx, sy + 1, width, height)) {
+        down_mass = fluid_get_mass(mass, solid, sx, sy + 1, width, height);
+        down_capacity = cell_capacity(sy + 1, max_mass);
+
+        if (down_mass < down_capacity - min_mass && self_mass > down_mass + min_mass) {
+            return 1;
+        }
+    }
+
+    /*
+        2. Atlosan balra-le:
+        csak akkor, ha egyenesen lefele nem tudott.
+    */
+    if (fluid_is_open(solid, sx - 1, sy + 1, width, height)) {
+        down_left_mass = fluid_get_mass(mass, solid, sx - 1, sy + 1, width, height);
+        down_left_capacity = cell_capacity(sy + 1, max_mass);
+
+        if (down_left_mass < down_left_capacity - min_mass && self_mass > down_left_mass + min_mass) {
+            return 2;
+        }
+    }
+
+    /*
+        3. Atlosan jobbra-le:
+        csak akkor, ha lefele es balra-le sem ment.
+    */
+    if (fluid_is_open(solid, sx + 1, sy + 1, width, height)) {
+        down_right_mass = fluid_get_mass(mass, solid, sx + 1, sy + 1, width, height);
+        down_right_capacity = cell_capacity(sy + 1, max_mass);
+
+        if (down_right_mass < down_right_capacity - min_mass && self_mass > down_right_mass + min_mass) {
+            return 3;
+        }
+    }
+
+    /*
+        4. Oldalra:
+        csak akkor, ha mar tultoltott.
+        Ez gatolja meg, hogy mindenhol ritka folyadek legyen.
+    */
+    if (self_mass > max_mass + 0.20f) {
+        if (fluid_is_open(solid, sx - 1, sy, width, height)) {
+            left_mass = fluid_get_mass(mass, solid, sx - 1, sy, width, height);
+
+            if (self_mass > left_mass + min_mass) {
+                return 4;
+            }
+        }
+
+        if (fluid_is_open(solid, sx + 1, sy, width, height)) {
+            right_mass = fluid_get_mass(mass, solid, sx + 1, sy, width, height);
+
+            if (self_mass > right_mass + min_mass) {
+                return 5;
+            }
+        }
+    }
+
+    return 0;
 }
 
 __kernel void fluid_step(
@@ -69,19 +178,13 @@ __kernel void fluid_step(
 
     float self_mass;
     float new_mass_value;
+    float local_max;
 
-    float up_mass;
-    float down_mass;
-    float left_mass;
-    float right_mass;
-    float up_left_mass;
-    float up_right_mass;
-    float down_left_mass;
-    float down_right_mass;
+    int source_dir;
 
-    float flow_in;
-    float flow_out;
-    float diff;
+    float source_mass;
+    float target_mass;
+    float flow_amount;
     float capacity;
 
     if (x >= width || y >= height) {
@@ -98,86 +201,164 @@ __kernel void fluid_step(
     self_mass = mass[idx];
     new_mass_value = self_mass;
 
-    up_mass = fluid_mass_at(mass, solid, x, y - 1, width, height);
-    down_mass = fluid_mass_at(mass, solid, x, y + 1, width, height);
-    left_mass = fluid_mass_at(mass, solid, x - 1, y, width, height);
-    right_mass = fluid_mass_at(mass, solid, x + 1, y, width, height);
-    up_left_mass = fluid_mass_at(mass, solid, x - 1, y - 1, width, height);
-    up_right_mass = fluid_mass_at(mass, solid, x + 1, y - 1, width, height);
-    down_left_mass = fluid_mass_at(mass, solid, x - 1, y + 1, width, height);
-    down_right_mass = fluid_mass_at(mass, solid, x + 1, y + 1, width, height);
+    local_max = cell_capacity(y, max_mass);
 
-    /* --- Inflow from upper neighbors --- */
+    /*
+        Bejovo folyadek felulrol:
+        a fenti cella csak akkor ad ide, ha neki ez az elso valasztott iranya.
+    */
+    if (fluid_is_open(solid, x, y - 1, width, height)) {
+        source_dir = fluid_primary_direction(
+            mass, solid,
+            x, y - 1,
+            width, height,
+            max_mass,
+            min_mass
+        );
 
-    if (fluid_is_open_cell(solid, x, y - 1, width, height)) {
-        diff = up_mass - self_mass;
-        capacity = max_mass - self_mass;
-        flow_in = positive_min(diff * down_rate, capacity);
-        new_mass_value += flow_in;
+        if (source_dir == 1) {
+            source_mass = fluid_get_mass(mass, solid, x, y - 1, width, height);
+            target_mass = self_mass;
+
+            capacity = local_max - new_mass_value;
+            flow_amount = positive_min((source_mass - target_mass) * down_rate, capacity);
+
+            new_mass_value += flow_amount;
+        }
     }
 
-    if (fluid_is_open_cell(solid, x - 1, y - 1, width, height)) {
-        diff = up_left_mass - self_mass;
-        capacity = max_mass - self_mass;
-        flow_in = positive_min(diff * diag_rate, capacity);
-        new_mass_value += flow_in;
+    /*
+        Bejovo folyadek bal-fentrol:
+        akkor johet, ha a bal-felso cella jobbra-le akar menni.
+    */
+    if (fluid_is_open(solid, x - 1, y - 1, width, height)) {
+        source_dir = fluid_primary_direction(
+            mass, solid,
+            x - 1, y - 1,
+            width, height,
+            max_mass,
+            min_mass
+        );
+
+        if (source_dir == 3) {
+            source_mass = fluid_get_mass(mass, solid, x - 1, y - 1, width, height);
+            target_mass = self_mass;
+
+            capacity = local_max - new_mass_value;
+            flow_amount = positive_min((source_mass - target_mass) * diag_rate, capacity);
+
+            new_mass_value += flow_amount;
+        }
     }
 
-    if (fluid_is_open_cell(solid, x + 1, y - 1, width, height)) {
-        diff = up_right_mass - self_mass;
-        capacity = max_mass - self_mass;
-        flow_in = positive_min(diff * diag_rate, capacity);
-        new_mass_value += flow_in;
+    /*
+        Bejovo folyadek jobb-fentrol:
+        akkor johet, ha a jobb-felso cella balra-le akar menni.
+    */
+    if (fluid_is_open(solid, x + 1, y - 1, width, height)) {
+        source_dir = fluid_primary_direction(
+            mass, solid,
+            x + 1, y - 1,
+            width, height,
+            max_mass,
+            min_mass
+        );
+
+        if (source_dir == 2) {
+            source_mass = fluid_get_mass(mass, solid, x + 1, y - 1, width, height);
+            target_mass = self_mass;
+
+            capacity = local_max - new_mass_value;
+            flow_amount = positive_min((source_mass - target_mass) * diag_rate, capacity);
+
+            new_mass_value += flow_amount;
+        }
     }
 
-    /* --- Side inflow for local equalization --- */
+    /*
+        Bejovo folyadek balrol:
+        csak akkor, ha a bal cella oldalra, jobbra akar menni.
+    */
+    if (fluid_is_open(solid, x - 1, y, width, height)) {
+        source_dir = fluid_primary_direction(
+            mass, solid,
+            x - 1, y,
+            width, height,
+            max_mass,
+            min_mass
+        );
 
-    if (fluid_is_open_cell(solid, x - 1, y, width, height)) {
-        diff = left_mass - self_mass;
-        capacity = max_mass - self_mass;
-        flow_in = positive_min(diff * side_rate, capacity);
-        new_mass_value += flow_in;
+        if (source_dir == 5) {
+            source_mass = fluid_get_mass(mass, solid, x - 1, y, width, height);
+            target_mass = self_mass;
+
+            capacity = local_max - new_mass_value;
+            flow_amount = positive_min((source_mass - target_mass) * side_rate, capacity);
+
+            new_mass_value += flow_amount;
+        }
     }
 
-    if (fluid_is_open_cell(solid, x + 1, y, width, height)) {
-        diff = right_mass - self_mass;
-        capacity = max_mass - self_mass;
-        flow_in = positive_min(diff * side_rate, capacity);
-        new_mass_value += flow_in;
+    /*
+        Bejovo folyadek jobbrol:
+        csak akkor, ha a jobb cella oldalra, balra akar menni.
+    */
+    if (fluid_is_open(solid, x + 1, y, width, height)) {
+        source_dir = fluid_primary_direction(
+            mass, solid,
+            x + 1, y,
+            width, height,
+            max_mass,
+            min_mass
+        );
+
+        if (source_dir == 4) {
+            source_mass = fluid_get_mass(mass, solid, x + 1, y, width, height);
+            target_mass = self_mass;
+
+            capacity = local_max - new_mass_value;
+            flow_amount = positive_min((source_mass - target_mass) * side_rate, capacity);
+
+            new_mass_value += flow_amount;
+        }
     }
 
-    /* --- Outflow to lower neighbors --- */
+    /*
+        Kiaramlas:
+        a sajat cella csak egyetlen, prioritas szerint elso iranyba ad le.
+    */
+    source_dir = fluid_primary_direction(
+        mass, solid,
+        x, y,
+        width, height,
+        max_mass,
+        min_mass
+    );
 
-    if (fluid_is_open_cell(solid, x, y + 1, width, height)) {
-        diff = self_mass - down_mass;
-        flow_out = positive_min(diff * down_rate, self_mass);
-        new_mass_value -= flow_out;
+    if (source_dir == 1) {
+        target_mass = fluid_get_mass(mass, solid, x, y + 1, width, height);
+        flow_amount = positive_min((self_mass - target_mass) * down_rate, self_mass);
+        new_mass_value -= flow_amount;
     }
-
-    if (fluid_is_open_cell(solid, x - 1, y + 1, width, height)) {
-        diff = self_mass - down_left_mass;
-        flow_out = positive_min(diff * diag_rate, self_mass);
-        new_mass_value -= flow_out;
+    else if (source_dir == 2) {
+        target_mass = fluid_get_mass(mass, solid, x - 1, y + 1, width, height);
+        flow_amount = positive_min((self_mass - target_mass) * diag_rate, self_mass);
+        new_mass_value -= flow_amount;
     }
-
-    if (fluid_is_open_cell(solid, x + 1, y + 1, width, height)) {
-        diff = self_mass - down_right_mass;
-        flow_out = positive_min(diff * diag_rate, self_mass);
-        new_mass_value -= flow_out;
+    else if (source_dir == 3) {
+        target_mass = fluid_get_mass(mass, solid, x + 1, y + 1, width, height);
+        flow_amount = positive_min((self_mass - target_mass) * diag_rate, self_mass);
+        new_mass_value -= flow_amount;
     }
-
-    /* --- Side outflow --- */
-
-    if (fluid_is_open_cell(solid, x - 1, y, width, height)) {
-        diff = self_mass - left_mass;
-        flow_out = positive_min(diff * side_rate, self_mass);
-        new_mass_value -= flow_out;
+    else if (source_dir == 4) {
+        target_mass = fluid_get_mass(mass, solid, x - 1, y, width, height);
+        flow_amount = positive_min((self_mass - target_mass) * side_rate, self_mass);
+        new_mass_value -= flow_amount;
     }
-
-    if (fluid_is_open_cell(solid, x + 1, y, width, height)) {
-        diff = self_mass - right_mass;
-        flow_out = positive_min(diff * side_rate, self_mass);
-        new_mass_value -= flow_out;
+    else if (source_dir == 5) {
+        target_mass = fluid_get_mass(mass, solid, x + 1, y, width, height);
+        flow_amount = positive_min((self_mass - target_mass) * side_rate, self_mass);
+        new_mass_value -= flow_amount;
     }
 
     if (new_mass_value < min_mass) {
@@ -188,8 +369,8 @@ __kernel void fluid_step(
         new_mass_value = 0.0f;
     }
 
-    if (new_mass_value > max_mass) {
-        new_mass_value = max_mass;
+    if (new_mass_value > local_max) {
+        new_mass_value = local_max;
     }
 
     next_mass[idx] = new_mass_value;

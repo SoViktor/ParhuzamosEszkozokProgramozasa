@@ -3,12 +3,14 @@
 
 #include "fluid_sim.h"
 #include "fluid_opencl.h"
+#include "fluid_visualizer.h"
 
 #define KERNEL_FILE_PATH "FluidSim/Kernels/Fluid_step.cl"
 #define KERNEL_NAME "fluid_step"
 
 #define SIMULATION_STEPS 200
-#define PRINT_INTERVAL 10
+#define PRINT_INTERVAL 1
+#define FRAME_SCALE 8
 
 static void build_test_scene(FluidSim* sim)
 {
@@ -42,6 +44,7 @@ int main(void)
     FluidSim sim;
     FluidOpenCL gpu;
     int step;
+    char filename[128];
 
     if (!fluid_sim_init(&sim)) {
         printf("[ERROR] A FluidSim inicializalasa sikertelen.\n");
@@ -92,9 +95,13 @@ int main(void)
                 return 1;
             }
 
-            printf("Allapot %d lepes utan:\n", step);
-            fluid_sim_print_combined(&sim);
-            printf("\n");
+            sprintf(filename, "frames/frame_%05d.ppm", step);
+
+            if (!fluid_save_ppm(&sim, filename, FRAME_SCALE)) {
+                printf("[ERROR] Frame mentes sikertelen: %s\n", filename);
+            } else {
+                printf("[INFO] Frame mentve: %s\n", filename);
+            }
         }
     }
 
