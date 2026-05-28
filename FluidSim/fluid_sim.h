@@ -11,8 +11,8 @@
 #define MIN_MASS 0.0001f
 
 #define DOWN_RATE 0.90f
-#define DIAG_RATE 0.2f
-#define SIDE_RATE 0.0005f
+#define DIAG_RATE 0.20f
+#define SIDE_RATE 0.05f
 
 #define CELL_EMPTY 0
 #define CELL_SOLID 1

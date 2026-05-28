@@ -52,7 +52,7 @@ inline float positive_min(float a, float b)
 
 inline float cell_capacity(int y, float max_mass)
 {
-    return max_mass + (float)y * 0.05f;
+    return max_mass;
 }
 
 /*
@@ -138,7 +138,7 @@ inline int fluid_primary_direction(
         csak akkor, ha mar tultoltott.
         Ez gatolja meg, hogy mindenhol ritka folyadek legyen.
     */
-    if (self_mass > max_mass + 0.20f) {
+    if (self_mass > max_mass + 0.50f) {
         if (fluid_is_open(solid, sx - 1, sy, width, height)) {
             left_mass = fluid_get_mass(mass, solid, sx - 1, sy, width, height);
 
